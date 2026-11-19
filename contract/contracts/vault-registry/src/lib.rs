@@ -1746,13 +1746,19 @@ impl VaultRegistry {
     }
 
     /// Set up to `MAX_METADATA_POINTERS` redundant metadata pointers (e.g.
-    /// IPFS + Arweave + hosted) with `pointers[primary]` as the preferred one,
-    /// so the resource survives a single storage outage. Only the creator may
-    /// call this. Every pointer is validated like `update_metadata`, and
-    /// `Resource.metadata` is set to the primary pointer so single-pointer
-    /// readers keep working. Subject to the same freeze / content-hash rules
-    /// as `update_metadata`: a frozen resource may only re-publish mirrors
-    /// whose primary equals its current pointer. Emits `setptrs`.
+    /// IPFS + Arweave + hosted HTTPS + content hash) with `pointers[primary]`
+    /// as the preferred primary, so the resource survives a single storage
+    /// outage. Only the creator may call this.
+    ///
+    /// Every pointer is validated with `validate_metadata_pointer` (same rules
+    /// as `update_metadata`), duplicates are rejected with
+    /// `InvalidMetadataPointers`, and `Resource.metadata` is updated to the
+    /// primary pointer so single-pointer readers keep working transparently.
+    /// Subject to the same freeze / content-hash rules as `update_metadata`: a
+    /// frozen or content-hashed resource may still add or refresh mirrors as
+    /// long as `pointers[primary]` equals its current `Resource.metadata`, but
+    /// changing the primary returns `MetadataFrozen`. Emits `setptrs` (and
+    /// `updmeta` when the primary pointer changes).
     pub fn set_metadata_pointers(
         env: Env,
         id: String,
@@ -1797,6 +1803,8 @@ impl VaultRegistry {
                     new_metadata: primary_pointer,
                 },
             );
+        } else {
+            Self::bump_persistent(&env, &DataKey::Resource(id.clone()));
         }
 
         let record = MetadataPointers { pointers, primary };
@@ -1807,8 +1815,13 @@ impl VaultRegistry {
         Ok(())
     }
 
-    /// All metadata pointers for a resource. Falls back to a single-entry list
-    /// holding `Resource.metadata` (primary `0`) when no mirrors were set.
+    /// Return all metadata pointers for a resource together with the preferred
+    /// `primary` index. Falls back to a single-entry list holding
+    /// `Resource.metadata` (`primary = 0`) when no mirrors have been set or
+    /// after `update_metadata` invalidated a prior mirror set.
+    ///
+    /// Errors `InvalidResourceId` / `NotFound` like `get`, and remains
+    /// readable while the registry is paused.
     pub fn get_metadata_pointers(env: Env, id: String) -> Result<MetadataPointers, Error> {
         Self::validate_resource_id(&id)?;
         let resource = Self::load(&env, &id)?;
@@ -2649,17 +2662,23 @@ impl VaultRegistry {
         result
     }
 
+    /// Return up to `limit` (capped at [`TOP_TAGS_CAP`]) tags ordered by
+    /// descending successful-registration count, breaking ties
+    /// lexicographically by normalized tag name.
+    ///
+    /// Counts reflect normalized tags recorded at registration time (across
+    /// `register`, `register_with_hash`, `register_with_memo`, and succeeded
+    /// items in `register_batch`), saturate at `u32::MAX`, and are not altered
+    /// by failed registrations, `set_tags`, or tombstoning. Returns an empty
+    /// vector when `limit == 0` or no tags have been registered. Available
+    /// while paused.
     pub fn top_tags(env: Env, limit: u32) -> Vec<TagPopularity> {
         let page_size = limit.min(TOP_TAGS_CAP);
         if page_size == 0 {
             return Vec::new(&env);
         }
 
-        let stats: Vec<TagPopularity> = env
-            .storage()
-            .instance()
-            .get(&DataKey::TopTags)
-            .unwrap_or_else(|| Vec::new(&env));
+        let stats: Vec<TagPopularity> = Self::load_top_tags(&env);
         let mut result: Vec<TagPopularity> = Vec::new(&env);
         let mut i = 0u32;
         while i < stats.len() && result.len() < page_size {
@@ -4030,12 +4049,22 @@ impl VaultRegistry {
         Ok(())
     }
 
-    /// Retry-safe `record_payment`: same auth, validation, and pause rules,
-    /// but returns the stored receipt. If `receipt_id` is already recorded
-    /// with the same `resource_id`, `payer`, `amount`, and `tx_hash`, that
-    /// receipt is returned unchanged, whatever its state, with no write and
-    /// no event. The same id with different arguments still errors
-    /// `ReceiptAlreadyExists`.
+    /// Retry-safe `record_payment`: enforces the same auth, settler role,
+    /// pause (both global and payment-scope), and argument checks, then
+    /// resolves `receipt_id` idempotently:
+    ///
+    /// - If `receipt_id` is absent, writes the receipt and secondary indexes
+    ///   exactly like `record_payment`, emits `payment`, and returns the new
+    ///   [`PaymentReceipt`].
+    /// - If `receipt_id` already exists with identical `resource_id`, `payer`,
+    ///   `amount`, and `tx_hash`, returns the stored [`PaymentReceipt`] as-is
+    ///   with no storage write and no event — even if the receipt has since
+    ///   settled, been partially refunded, had its resource repriced, delisted,
+    ///   or tombstoned, or is retried by a different authorized settler.
+    /// - If `receipt_id` already exists with any differing payload field,
+    ///   rejects the call with `Error::ReceiptAlreadyExists`.
+    /// - If a new `receipt_id` reuses a `tx_hash` already backing another
+    ///   receipt, rejects the call with `Error::DuplicateTxHash`.
     pub fn record_payment_idempotent(
         env: Env,
         settler: Address,
@@ -4054,10 +4083,8 @@ impl VaultRegistry {
             amount,
             &tx_hash,
         )?;
-        let stored: Option<PaymentReceipt> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::PaymentReceipt(receipt_id.clone()));
+        let receipt_key = DataKey::PaymentReceipt(receipt_id.clone());
+        let stored: Option<PaymentReceipt> = env.storage().persistent().get(&receipt_key);
         match stored {
             Some(receipt)
                 if receipt.resource_id == resource_id
@@ -4926,16 +4953,23 @@ impl VaultRegistry {
         env.storage().persistent().get(&key).ok_or(Error::NotFound)
     }
 
-    /// Whether a resource currently carries a moderator dispute flag.
-    /// Errors with `NotFound` if the resource does not exist.
+    /// Whether a resource currently carries an active moderator dispute flag.
+    ///
+    /// Errors `InvalidResourceId` or `NotFound` like `get`, and remains
+    /// readable while paused or after a resource is tombstoned.
     pub fn is_flagged(env: Env, id: String) -> Result<bool, Error> {
         Self::validate_resource_id(&id)?;
         Ok(Self::load(&env, &id)?.dispute_flag.is_flagged())
     }
 
-    /// Dispute flag, reason hash, and last acting moderator for a resource in
-    /// one read. Errors with `NotFound` if the resource does not exist; a
-    /// resource no moderator has touched returns `NoFlag` and two `None`s.
+    /// Composite moderation read returning a resource's active `dispute_flag`,
+    /// optional `reason_hash`, and `last_moderator` in one call.
+    ///
+    /// Errors `InvalidResourceId` or `NotFound` like `get`. A resource no
+    /// moderator has acted on returns `DisputeFlag::NoFlag` and two `None`s;
+    /// legacy resources flagged before `DataKey::FlagModerator` existed report
+    /// `last_moderator: None` until the next moderator write. Remains readable
+    /// while paused or after tombstoning.
     pub fn flag_details(env: Env, id: String) -> Result<FlagDetails, Error> {
         Self::validate_resource_id(&id)?;
         let resource = Self::load(&env, &id)?;
@@ -5232,6 +5266,10 @@ impl VaultRegistry {
         }
         let key = DataKey::Resource(resource_id.clone());
         Self::bump_persistent(&env, &key);
+        let pointers_key = DataKey::MetadataPointers(resource_id.clone());
+        if env.storage().persistent().has(&pointers_key) {
+            Self::bump_persistent(&env, &pointers_key);
+        }
         env.events()
             .publish((symbol_short!("ttlext"), resource_id), ());
         Ok(())
@@ -6035,11 +6073,16 @@ impl VaultRegistry {
             .ok_or(Error::NotFound)
     }
 
-    /// Remember `moderator` as the last to act on `id`'s moderation state.
+    /// Remember `moderator` as the last to act on `id`'s moderation state and
+    /// keep any attached `FlagReasonHash` entry TTL-synchronized with it.
     fn record_flag_moderator(env: &Env, id: &String, moderator: &Address) {
         let key = DataKey::FlagModerator(id.clone());
         env.storage().persistent().set(&key, moderator);
         Self::bump_persistent(env, &key);
+        let reason_key = DataKey::FlagReasonHash(id.clone());
+        if env.storage().persistent().has(&reason_key) {
+            Self::bump_persistent(env, &reason_key);
+        }
     }
 
     fn save(env: &Env, resource: &mut Resource) {
@@ -6051,6 +6094,10 @@ impl VaultRegistry {
         let royalty_key = AuxKey::RoyaltiesDisabled(resource.id.clone());
         if env.storage().persistent().has(&royalty_key) {
             Self::bump_persistent(env, &royalty_key);
+        }
+        let pointers_key = DataKey::MetadataPointers(resource.id.clone());
+        if env.storage().persistent().has(&pointers_key) {
+            Self::bump_persistent(env, &pointers_key);
         }
     }
 

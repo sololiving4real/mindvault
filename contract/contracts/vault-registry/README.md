@@ -19,6 +19,7 @@ see [`contract/README.md`](../../README.md).
 | 0.10 USDC           | `1_000_000` base units                                     |                                                        |
 | Max price           | `1_000_000_000_000_000_000` base units                     | 100 billion USDC (10^18 units at 7 decimals)           |
 | Max metadata        | 512 bytes                                                  | Must start with a supported prefix (see below)         |
+| Max metadata mirrors | 4                                                         | `MAX_METADATA_POINTERS` for `set_metadata_pointers`    |
 | Max tags            | 8                                                          | Each max 32 bytes, normalized to lowercase ASCII       |
 | Max top tags        | 20                                                         | `top_tags` response cap; counts saturate at `u32::MAX` |
 
@@ -305,10 +306,20 @@ stellar contract invoke \
   --id $CONTRACT --rpc-url $RPC --network-passphrase "Test SDF Network ; September 2015" \
   -- list_by_dispute_status --flagged true --start 0 --limit 20
 
+# Check only whether a resource currently carries a dispute flag
+stellar contract invoke \
+  --id $CONTRACT --rpc-url $RPC --network-passphrase "Test SDF Network ; September 2015" \
+  -- is_flagged --id swcn98besxpp6t1u8e77fqz3
+
 # One resource's moderation state: dispute flag, reason hash, last moderator
 stellar contract invoke \
   --id $CONTRACT --rpc-url $RPC --network-passphrase "Test SDF Network ; September 2015" \
   -- flag_details --id swcn98besxpp6t1u8e77fqz3
+
+# All metadata pointers and preferred primary index (falls back to [metadata], primary 0)
+stellar contract invoke \
+  --id $CONTRACT --rpc-url $RPC --network-passphrase "Test SDF Network ; September 2015" \
+  -- get_metadata_pointers --id swcn98besxpp6t1u8e77fqz3
 
 # How many resources does a creator currently own?
 stellar contract invoke \
@@ -346,6 +357,27 @@ stellar contract invoke \
   -- update_metadata \
   --id swcn98besxpp6t1u8e77fqz3 \
   --metadata 'ipfs://QmNewHash'
+
+# Publish redundant multi-scheme metadata mirrors (IPFS + Arweave + hosted HTTPS)
+stellar contract invoke \
+  --id $CONTRACT --rpc-url $RPC --network-passphrase "Test SDF Network ; September 2015" \
+  --source my-identity \
+  -- set_metadata_pointers \
+  --id swcn98besxpp6t1u8e77fqz3 \
+  --pointers '["ipfs://QmNewHash","ar://arweaveTxId","https://cdn.example.org/vault/item.json"]' \
+  --primary 0
+
+# Retry-safe payment recording (returns existing receipt on identical retry)
+stellar contract invoke \
+  --id $CONTRACT --rpc-url $RPC --network-passphrase "Test SDF Network ; September 2015" \
+  --source settler-identity \
+  -- record_payment_idempotent \
+  --settler $(stellar keys address settler-identity) \
+  --receipt_id rcpt-001 \
+  --resource_id swcn98besxpp6t1u8e77fqz3 \
+  --payer GB6LGS25QN3DFNXKFWCTKB3FMKZFLW7OIKCX6HJKKIEPV3H2JJKBIMHV \
+  --amount 5000000 \
+  --tx_hash 0xsettlementtxhash
 
 # Replace discovery tags
 stellar contract invoke \
